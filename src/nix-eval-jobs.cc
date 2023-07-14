@@ -447,23 +447,29 @@ std::function<void()> collector(Sync<State> &state_,
                     continue;
                 } else if (s == "next") {
                     /* Wait for a job name to become available. */
-                    json attrPath;
 
-                    while (true) {
+                    json attrPath;
+                    bool job_name_available = false;
+                    while (!job_name_available) {
                         checkInterrupt();
                         auto state(state_.lock());
-                        if ((state->todo.empty() && state->active.empty()) ||
-                            state->exc) {
+                        if (state->exc) {
                             writeLine(proc->to.get(), "exit");
                             return;
                         }
-                        if (!state->todo.empty()) {
+                        if (state->todo.empty()) {
+                            if (state->active.empty()) {
+                                writeLine(proc->to.get(), "exit");
+                                return;
+                            } else {
+                                state.wait(wakeup);
+                            }
+                        } else {
                             attrPath = *state->todo.begin();
                             state->todo.erase(state->todo.begin());
                             state->active.insert(attrPath);
-                            break;
-                        } else
-                            state.wait(wakeup);
+                            job_name_available = true;
+                        }
                     }
 
                     /* Tell the worker to evaluate it. */
@@ -482,6 +488,7 @@ std::function<void()> collector(Sync<State> &state_,
                             newAttrs.push_back(newAttr);
                         }
                     } else {
+                        // this is actually a mutex on stdout
                         auto state(state_.lock());
                         std::cout << respString << "\n" << std::flush;
                     }
