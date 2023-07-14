@@ -424,8 +424,6 @@ struct Proc {
         from = std::move(fromPipe.readSide);
         pid = p;
     }
-
-    ~Proc() {}
 };
 
 struct State {
