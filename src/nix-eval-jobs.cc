@@ -257,6 +257,66 @@ std::string attrPathJoin(json input) {
                            });
 }
 
+json worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
+                     std::string attrPath) {
+    auto vTmp = findAlongAttrPath(*state, attrPath, autoArgs, *vRoot).first;
+
+    json reply;
+
+    auto v = state->allocValue();
+    state->autoCallFunction(autoArgs, *vTmp, *v);
+
+    if (v->type() == nAttrs) {
+        if (auto drvInfo = getDerivation(*state, *v, false)) {
+            auto drv = Drv(*state, *drvInfo);
+            reply.update(drv);
+
+            /* Register the derivation as a GC root.  !!! This
+               registers roots for jobs that we may have already
+               done. */
+            if (myArgs.gcRootsDir != "") {
+                Path root = myArgs.gcRootsDir + "/" +
+                            std::string(baseNameOf(drv.drvPath));
+                if (!pathExists(root)) {
+                    auto localStore =
+                        state->store.dynamic_pointer_cast<LocalFSStore>();
+                    auto storePath = localStore->parseStorePath(drv.drvPath);
+                    localStore->addPermRoot(storePath, root);
+                }
+            }
+        } else {
+            auto attrs = nlohmann::json::array();
+
+            // Dont require `recurseForDerivations = true;` for top-level
+            // attrset
+            bool recurse = myArgs.forceRecurse || attrPath == "";
+
+            for (auto &i : v->attrs->lexicographicOrder(state->symbols)) {
+                const std::string &name = state->symbols[i->name];
+                attrs.push_back(name);
+
+                // TODO: I think we add "recurseForDerivations" to the
+                // attributes to recurse into, even if we know it's a boolean
+                if (name == "recurseForDerivations" && !myArgs.forceRecurse) {
+                    auto attrv = v->attrs->get(state->sRecurseForDerivations);
+                    recurse = state->forceBool(
+                        *attrv->value, attrv->pos,
+                        "while evaluating recurseForDerivations");
+                }
+            }
+            if (recurse)
+                reply["attrs"] = std::move(attrs);
+            else
+                reply["attrs"] = nlohmann::json::array();
+        }
+    } else {
+        // We ignore everything that cannot be build
+        reply["attrs"] = nlohmann::json::array();
+    }
+
+    return reply;
+}
+
 static void worker(AutoCloseFD &to, AutoCloseFD &from) {
     // I don't think this needs to be shared, we own it and it could be on the
     // stack. But InstallableFlake wants a ref<EvalState> which is a shared
@@ -307,79 +367,28 @@ static void worker(AutoCloseFD &to, AutoCloseFD &from) {
         debug("worker process %d at '%s'", getpid(), path);
 
         /* Evaluate it and send info back to the collector. */
-        json reply = json{{"attr", attrPathS}, {"attrPath", path}};
         try {
-            auto vTmp =
-                findAlongAttrPath(*state, attrPathS, autoArgs, *vRoot).first;
-
-            auto v = state->allocValue();
-            state->autoCallFunction(autoArgs, *vTmp, *v);
-
-            if (v->type() == nAttrs) {
-                if (auto drvInfo = getDerivation(*state, *v, false)) {
-                    auto drv = Drv(*state, *drvInfo);
-                    reply.update(drv);
-
-                    /* Register the derivation as a GC root.  !!! This
-                       registers roots for jobs that we may have already
-                       done. */
-                    if (myArgs.gcRootsDir != "") {
-                        Path root = myArgs.gcRootsDir + "/" +
-                                    std::string(baseNameOf(drv.drvPath));
-                        if (!pathExists(root)) {
-                            auto localStore =
-                                state->store
-                                    .dynamic_pointer_cast<LocalFSStore>();
-                            auto storePath =
-                                localStore->parseStorePath(drv.drvPath);
-                            localStore->addPermRoot(storePath, root);
-                        }
-                    }
-                } else {
-                    auto attrs = nlohmann::json::array();
-                    bool recurse =
-                        myArgs.forceRecurse ||
-                        path.size() == 0; // Dont require `recurseForDerivations
-                                          // = true;` for top-level attrset
-
-                    for (auto &i :
-                         v->attrs->lexicographicOrder(state->symbols)) {
-                        const std::string &name = state->symbols[i->name];
-                        attrs.push_back(name);
-
-                        if (name == "recurseForDerivations" &&
-                            !myArgs.forceRecurse) {
-                            auto attrv =
-                                v->attrs->get(state->sRecurseForDerivations);
-                            recurse = state->forceBool(
-                                *attrv->value, attrv->pos,
-                                "while evaluating recurseForDerivations");
-                        }
-                    }
-                    if (recurse)
-                        reply["attrs"] = std::move(attrs);
-                    else
-                        reply["attrs"] = nlohmann::json::array();
-                }
-            } else {
-                // We ignore everything that cannot be build
-                reply["attrs"] = nlohmann::json::array();
-            }
+            json reply = {{"attr", attrPathS}, {"attrPath", path}};
+            reply.update(worker_evaluate(state, autoArgs, vRoot, attrPathS));
+            writeLine(to.get(), reply.dump());
         } catch (EvalError &e) {
             auto err = e.info();
             std::ostringstream oss;
             showErrorInfo(oss, err, loggerSettings.showTrace.get());
             auto msg = oss.str();
 
-            // Transmits the error we got from the previous evaluation
-            // in the JSON output.
-            reply["error"] = filterANSIEscapes(msg, true);
             // Don't forget to print it into the STDERR log, this is
             // what's shown in the Hydra UI.
             printError(e.msg());
-        }
 
-        writeLine(to.get(), reply.dump());
+            // Transmits the error we got from the previous evaluation
+            // in the JSON output.
+            json reply = {{"attr", attrPathS},
+                          {"attrPath", path},
+                          {"error", filterANSIEscapes(msg, true)}};
+
+            writeLine(to.get(), reply.dump());
+        }
 
         /* If our RSS exceeds the maximum, exit. The collector will
            start a new process. */
