@@ -1,5 +1,6 @@
 #include <map>
 #include <iostream>
+#include <memory>
 #include <thread>
 #include <filesystem>
 
@@ -437,17 +438,14 @@ std::function<void()> collector(Sync<State> &state_,
                                 std::condition_variable &wakeup) {
     return [&]() {
         try {
-            std::optional<std::unique_ptr<Proc>> proc_;
+            std::unique_ptr<Proc> proc = std::make_unique<Proc>(worker);
 
             while (true) {
-
-                auto proc = proc_.has_value() ? std::move(proc_.value())
-                                              : std::make_unique<Proc>(worker);
-
                 /* Check whether the existing worker process is still there. */
                 auto s = readLine(proc->from.get());
+
                 if (s == "restart") {
-                    proc_ = std::nullopt;
+                    proc = std::make_unique<Proc>(worker);
                     continue;
                 } else if (s == "next") {
                     /* Wait for a job name to become available. */
@@ -489,8 +487,6 @@ std::function<void()> collector(Sync<State> &state_,
                         auto state(state_.lock());
                         std::cout << respString << "\n" << std::flush;
                     }
-
-                    proc_ = std::move(proc);
 
                     /* Add newly discovered job names to the queue. */
                     {
