@@ -436,7 +436,7 @@ std::function<void()> collector(Sync<State> &state_,
                                 std::condition_variable &wakeup) {
     return [&]() {
         try {
-            std::unique_ptr<Proc> proc = std::make_unique<Proc>(worker);
+            auto proc = std::make_unique<Proc>(worker);
 
             while (true) {
                 /* Check whether the existing worker process is still there. */
