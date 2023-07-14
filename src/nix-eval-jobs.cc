@@ -513,9 +513,9 @@ std::function<void()> collector(Sync<State> &state_,
                     } else {
                         // this is actually a mutex on stdout
                         auto state(state_.lock());
+                        state->active.erase(attrPath);
                         std::cout << respString << "\n" << std::flush;
                     }
-
                 } else {
                     auto json = json::parse(s);
                     throw Error("worker error: %s", (std::string)json["error"]);
