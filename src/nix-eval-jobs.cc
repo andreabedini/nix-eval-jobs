@@ -1,3 +1,4 @@
+#include "ref.hh"
 #include <map>
 #include <iostream>
 #include <memory>
@@ -256,14 +257,22 @@ std::string attrPathJoin(json input) {
                            });
 }
 
-static void worker(ref<EvalState> state, Bindings &autoArgs, AutoCloseFD &to,
-                   AutoCloseFD &from) {
+static void worker(AutoCloseFD &to, AutoCloseFD &from) {
+    // I don't think this needs to be shared, we own it and it could be on the
+    // stack. But InstallableFlake wants a ref<EvalState> which is a shared
+    // pointer, so I wonder what it does with it. Better play safe and give it
+    // what it wants.
+    auto state =
+        make_ref<EvalState>(myArgs.searchPath, openStore(*myArgs.evalStoreUrl));
+
+    Bindings &autoArgs = *myArgs.getAutoArgs(*state);
 
     nix::Value *vRoot = [&]() {
         if (myArgs.flake) {
             auto [flakeRef, fragment, outputSpec] =
                 parseFlakeRefWithFragmentAndExtendedOutputsSpec(
                     myArgs.releaseExpr, absPath("."));
+
             InstallableFlake flake{{},
                                    state,
                                    std::move(flakeRef),
@@ -383,9 +392,7 @@ static void worker(ref<EvalState> state, Bindings &autoArgs, AutoCloseFD &to,
     writeLine(to.get(), "restart");
 }
 
-typedef std::function<void(ref<EvalState> state, Bindings &autoArgs,
-                           AutoCloseFD &to, AutoCloseFD &from)>
-    Processor;
+typedef std::function<void(AutoCloseFD &to, AutoCloseFD &from)> Processor;
 
 /* Auto-cleanup of fork's process and fds. */
 struct Proc {
@@ -403,10 +410,7 @@ struct Proc {
                  std::make_shared<AutoCloseFD>(std::move(toPipe.readSide))}]() {
                 debug("created worker process %d", getpid());
                 try {
-                    auto state = std::make_shared<EvalState>(
-                        myArgs.searchPath, openStore(*myArgs.evalStoreUrl));
-                    Bindings &autoArgs = *myArgs.getAutoArgs(*state);
-                    proc(ref<EvalState>(state), autoArgs, *to, *from);
+                    proc(*to, *from);
                 } catch (Error &e) {
                     nlohmann::json err;
                     auto msg = e.msg();
