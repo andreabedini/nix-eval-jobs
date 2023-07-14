@@ -361,15 +361,15 @@ static void worker(AutoCloseFD &to, AutoCloseFD &from) {
             break;
         if (!hasPrefix(s, "do "))
             abort();
-        auto path = json::parse(s.substr(3));
-        auto attrPathS = attrPathJoin(path);
+        auto attrPath = json::parse(s.substr(3));
+        auto attr = attrPathJoin(attrPath);
 
-        debug("worker process %d at '%s'", getpid(), path);
+        debug("worker process %d at '%s'", getpid(), attrPath);
 
         /* Evaluate it and send info back to the collector. */
         try {
-            json reply = {{"attr", attrPathS}, {"attrPath", path}};
-            reply.update(worker_evaluate(state, autoArgs, vRoot, attrPathS));
+            json reply = {{"attr", attr}, {"attrPath", attrPath}};
+            reply.update(worker_evaluate(state, autoArgs, vRoot, attr));
             writeLine(to.get(), reply.dump());
         } catch (EvalError &e) {
             auto err = e.info();
@@ -383,8 +383,8 @@ static void worker(AutoCloseFD &to, AutoCloseFD &from) {
 
             // Transmits the error we got from the previous evaluation
             // in the JSON output.
-            json reply = {{"attr", attrPathS},
-                          {"attrPath", path},
+            json reply = {{"attr", attr},
+                          {"attrPath", attrPath},
                           {"error", filterANSIEscapes(msg, true)}};
 
             writeLine(to.get(), reply.dump());
