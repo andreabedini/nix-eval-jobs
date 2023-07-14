@@ -493,12 +493,22 @@ std::function<void()> collector(Sync<State> &state_,
                     auto response = json::parse(respString);
 
                     /* Handle the response. */
-                    std::vector<json> newAttrs;
                     if (response.find("attrs") != response.end()) {
+                        std::vector<json> newAttrs;
+
                         for (auto &i : response["attrs"]) {
                             json newAttr = json(response["attrPath"]);
                             newAttr.emplace_back(i);
                             newAttrs.push_back(newAttr);
+                        }
+                        /* Add newly discovered job names to the queue. */
+                        {
+                            auto state(state_.lock());
+                            state->active.erase(attrPath);
+                            for (auto p : newAttrs) {
+                                state->todo.insert(p);
+                            }
+                            wakeup.notify_all();
                         }
                     } else {
                         // this is actually a mutex on stdout
@@ -506,15 +516,6 @@ std::function<void()> collector(Sync<State> &state_,
                         std::cout << respString << "\n" << std::flush;
                     }
 
-                    /* Add newly discovered job names to the queue. */
-                    {
-                        auto state(state_.lock());
-                        state->active.erase(attrPath);
-                        for (auto p : newAttrs) {
-                            state->todo.insert(p);
-                        }
-                        wakeup.notify_all();
-                    }
                 } else {
                     auto json = json::parse(s);
                     throw Error("worker error: %s", (std::string)json["error"]);
