@@ -449,61 +449,61 @@ std::function<void()> collector(Sync<State> &state_,
                 if (s == "restart") {
                     proc_ = std::nullopt;
                     continue;
-                } else if (s != "next") {
-                    auto json = json::parse(s);
-                    throw Error("worker error: %s", (std::string)json["error"]);
-                }
+                } else if (s == "next") {
+                    /* Wait for a job name to become available. */
+                    json attrPath;
 
-                /* Wait for a job name to become available. */
-                json attrPath;
-
-                while (true) {
-                    checkInterrupt();
-                    auto state(state_.lock());
-                    if ((state->todo.empty() && state->active.empty()) ||
-                        state->exc) {
-                        writeLine(proc->to.get(), "exit");
-                        return;
+                    while (true) {
+                        checkInterrupt();
+                        auto state(state_.lock());
+                        if ((state->todo.empty() && state->active.empty()) ||
+                            state->exc) {
+                            writeLine(proc->to.get(), "exit");
+                            return;
+                        }
+                        if (!state->todo.empty()) {
+                            attrPath = *state->todo.begin();
+                            state->todo.erase(state->todo.begin());
+                            state->active.insert(attrPath);
+                            break;
+                        } else
+                            state.wait(wakeup);
                     }
-                    if (!state->todo.empty()) {
-                        attrPath = *state->todo.begin();
-                        state->todo.erase(state->todo.begin());
-                        state->active.insert(attrPath);
-                        break;
-                    } else
-                        state.wait(wakeup);
-                }
 
-                /* Tell the worker to evaluate it. */
-                writeLine(proc->to.get(), "do " + attrPath.dump());
+                    /* Tell the worker to evaluate it. */
+                    writeLine(proc->to.get(), "do " + attrPath.dump());
 
-                /* Wait for the response. */
-                auto respString = readLine(proc->from.get());
-                auto response = json::parse(respString);
+                    /* Wait for the response. */
+                    auto respString = readLine(proc->from.get());
+                    auto response = json::parse(respString);
 
-                /* Handle the response. */
-                std::vector<json> newAttrs;
-                if (response.find("attrs") != response.end()) {
-                    for (auto &i : response["attrs"]) {
-                        json newAttr = json(response["attrPath"]);
-                        newAttr.emplace_back(i);
-                        newAttrs.push_back(newAttr);
+                    /* Handle the response. */
+                    std::vector<json> newAttrs;
+                    if (response.find("attrs") != response.end()) {
+                        for (auto &i : response["attrs"]) {
+                            json newAttr = json(response["attrPath"]);
+                            newAttr.emplace_back(i);
+                            newAttrs.push_back(newAttr);
+                        }
+                    } else {
+                        auto state(state_.lock());
+                        std::cout << respString << "\n" << std::flush;
+                    }
+
+                    proc_ = std::move(proc);
+
+                    /* Add newly discovered job names to the queue. */
+                    {
+                        auto state(state_.lock());
+                        state->active.erase(attrPath);
+                        for (auto p : newAttrs) {
+                            state->todo.insert(p);
+                        }
+                        wakeup.notify_all();
                     }
                 } else {
-                    auto state(state_.lock());
-                    std::cout << respString << "\n" << std::flush;
-                }
-
-                proc_ = std::move(proc);
-
-                /* Add newly discovered job names to the queue. */
-                {
-                    auto state(state_.lock());
-                    state->active.erase(attrPath);
-                    for (auto p : newAttrs) {
-                        state->todo.insert(p);
-                    }
-                    wakeup.notify_all();
+                    auto json = json::parse(s);
+                    throw Error("worker error: %s", (std::string)json["error"]);
                 }
             }
         } catch (...) {
