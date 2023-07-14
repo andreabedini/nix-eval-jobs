@@ -261,16 +261,20 @@ static void worker(ref<EvalState> state, Bindings &autoArgs, AutoCloseFD &to,
     nix::Value *vRoot = [&]() {
         if (myArgs.flake) {
             auto [flakeRef, fragment, outputSpec] =
-                parseFlakeRefWithFragmentAndExtendedOutputsSpec(myArgs.releaseExpr,
-                                                                absPath("."));
-            InstallableFlake flake {
-                {}, state, std::move(flakeRef), fragment,
-                outputSpec, {}, {},
-                flake::LockFlags{
-                    .updateLockFile = false,
-                    .useRegistries = false,
-                    .allowUnlocked = false,
-                }};
+                parseFlakeRefWithFragmentAndExtendedOutputsSpec(
+                    myArgs.releaseExpr, absPath("."));
+            InstallableFlake flake{{},
+                                   state,
+                                   std::move(flakeRef),
+                                   fragment,
+                                   outputSpec,
+                                   {},
+                                   {},
+                                   flake::LockFlags{
+                                       .updateLockFile = false,
+                                       .useRegistries = false,
+                                       .allowUnlocked = false,
+                                   }};
 
             return flake.toValue(*state).first;
         } else {
