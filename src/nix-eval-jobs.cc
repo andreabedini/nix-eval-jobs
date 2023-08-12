@@ -4,6 +4,7 @@
 #include <memory>
 #include <queue>
 #include <ranges>
+#include <stop_token>
 #include <string>
 #include <thread>
 
@@ -327,72 +328,71 @@ int main(int argc, char **argv) {
     /* We are doing the garbage collection by killing forks */
     setenv("GC_DONT_GC", "1", 1);
 
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-        initGC();
+    initNix();
+    initGC();
 
-        myArgs.parseCmdline(argvToStrings(argc, argv));
+    myArgs.parseCmdline(argvToStrings(argc, argv));
 
-        /* FIXME: The build hook in conjunction with import-from-derivation
-         * is causing "unexpected EOF" during eval */
-        settings.builders = "";
+    /* FIXME: The build hook in conjunction with import-from-derivation
+     * is causing "unexpected EOF" during eval */
+    settings.builders = "";
 
-        /* Prevent access to paths outside of the Nix search path and
-           to the environment. */
-        evalSettings.restrictEval = false;
+    /* Prevent access to paths outside of the Nix search path and
+       to the environment. */
+    evalSettings.restrictEval = false;
 
-        /* When building a flake, use pure evaluation (no access to
-           'getEnv', 'currentSystem' etc. */
-        if (myArgs.impure) {
-            evalSettings.pureEval = false;
-        } else if (myArgs.flake) {
-            evalSettings.pureEval = true;
+    /* When building a flake, use pure evaluation (no access to
+       'getEnv', 'currentSystem' etc. */
+    if (myArgs.impure) {
+        evalSettings.pureEval = false;
+    } else if (myArgs.flake) {
+        evalSettings.pureEval = true;
+    }
+
+    if (myArgs.expr == "")
+        throw UsageError("no expression specified");
+
+    if (myArgs.gcRootsDir == "") {
+        printMsg(lvlError, "warning: `--gc-roots-dir' not specified");
+    } else {
+        myArgs.gcRootsDir = std::filesystem::absolute(myArgs.gcRootsDir);
+    }
+
+    auto addGCRoot = [](Drv const &drv, ref<EvalState> state) -> void {
+        Path root = myArgs.gcRootsDir + "/" + baseNameOf(drv.drvPath);
+        if (!pathExists(root)) {
+            auto localStore = state->store.dynamic_pointer_cast<LocalFSStore>();
+            auto storePath = localStore->parseStorePath(drv.drvPath);
+            localStore->addPermRoot(storePath, root);
         }
+    };
 
-        if (myArgs.expr == "")
-            throw UsageError("no expression specified");
+    if (myArgs.showTrace) {
+        loggerSettings.showTrace.assign(true);
+    }
 
-        if (myArgs.gcRootsDir == "") {
-            printMsg(lvlError, "warning: `--gc-roots-dir' not specified");
-        } else {
-            myArgs.gcRootsDir = std::filesystem::absolute(myArgs.gcRootsDir);
-        }
+    // I don't think this needs to be shared, we own it and it could be
+    // on the stack. But InstallableFlake wants a ref<EvalState> which
+    // is a shared pointer, so I wonder what it does with it. Better
+    // play safe and give it what it wants.
+    auto state =
+        make_ref<EvalState>(myArgs.searchPath, openStore(*myArgs.evalStoreUrl));
 
-        auto addGCRoot = [](Drv const &drv, ref<EvalState> state) -> void {
-            Path root = myArgs.gcRootsDir + "/" + baseNameOf(drv.drvPath);
-            if (!pathExists(root)) {
-                auto localStore =
-                    state->store.dynamic_pointer_cast<LocalFSStore>();
-                auto storePath = localStore->parseStorePath(drv.drvPath);
-                localStore->addPermRoot(storePath, root);
-            }
-        };
+    Bindings &autoArgs = *myArgs.getAutoArgs(*state);
 
-        if (myArgs.showTrace) {
-            loggerSettings.showTrace.assign(true);
-        }
+    // lazily initialised per-thread at first use (I think this is
+    // expensive)
+    Value *vRoot = topLevelValue(state, autoArgs);
 
-        // I don't think this needs to be shared, we own it and it could be
-        // on the stack. But InstallableFlake wants a ref<EvalState> which
-        // is a shared pointer, so I wonder what it does with it. Better
-        // play safe and give it what it wants.
-        auto state = make_ref<EvalState>(myArgs.searchPath,
-                                         openStore(*myArgs.evalStoreUrl));
+    std::queue<std::string> q;
+    q.push("");
 
-        Bindings &autoArgs = *myArgs.getAutoArgs(*state);
+    std::jthread worker([&](std::stop_token stoken) {
+        while (q.size() > 0 && !stoken.stop_requested()) {
+            auto attrPath = q.front();
+            q.pop();
 
-        // lazily initialised per-thread at first use (I think this is
-        // expensive)
-        Value *vRoot = topLevelValue(state, autoArgs);
-
-        std::queue<std::string> q;
-        q.push("");
-
-        std::jthread([&]() {
-            while (q.size() > 0) {
-                auto attrPath = q.front();
-                q.pop();
-
+            try {
                 evaluate(
                     state, autoArgs, vRoot, attrPath,
                     [&](Drv const &drv) {
@@ -407,7 +407,12 @@ int main(int argc, char **argv) {
                         for (auto &&attr : attrs)
                             q.push(attr);
                     });
-            };
-        });
+            } catch (const std::exception &e) {
+                printError("exception: %s", e.what());
+                return;
+            }
+        };
     });
+
+    worker.join();
 }
