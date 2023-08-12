@@ -2,6 +2,7 @@
 #include <map>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <thread>
 #include <filesystem>
 
@@ -257,11 +258,10 @@ std::string attrPathJoin(json input) {
                            });
 }
 
-json worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
-                     std::string attrPath) {
+template <typename F1, typename F2>
+void worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
+                     std::string const &attrPath, F1 f1, F2 f2) {
     auto vTmp = findAlongAttrPath(*state, attrPath, autoArgs, *vRoot).first;
-
-    json reply;
 
     auto v = state->allocValue();
     state->autoCallFunction(autoArgs, *vTmp, *v);
@@ -269,7 +269,6 @@ json worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
     if (v->type() == nAttrs) {
         if (auto drvInfo = getDerivation(*state, *v, false)) {
             auto drv = Drv(*state, *drvInfo);
-            reply.update(drv);
 
             /* Register the derivation as a GC root.  !!! This
                registers roots for jobs that we may have already
@@ -284,8 +283,10 @@ json worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
                     localStore->addPermRoot(storePath, root);
                 }
             }
+
+            f1(drv);
         } else {
-            auto attrs = nlohmann::json::array();
+            auto attrs = std::vector<std::string>();
 
             // Dont require `recurseForDerivations = true;` for top-level
             // attrset
@@ -305,16 +306,50 @@ json worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
                 }
             }
             if (recurse)
-                reply["attrs"] = std::move(attrs);
-            else
-                reply["attrs"] = nlohmann::json::array();
+                f2(attrs);
         }
-    } else {
-        // We ignore everything that cannot be build
-        reply["attrs"] = nlohmann::json::array();
     }
+}
 
-    return reply;
+template <typename F1, typename F2>
+void worker_evaluate_wrapper(std::string attrPath, F1 f1, F2 f2) {
+
+    // I don't think this needs to be shared, we own it and it could be on the
+    // stack. But InstallableFlake wants a ref<EvalState> which is a shared
+    // pointer, so I wonder what it does with it. Better play safe and give it
+    // what it wants.
+    auto state =
+        make_ref<EvalState>(myArgs.searchPath, openStore(*myArgs.evalStoreUrl));
+
+    Bindings &autoArgs = *myArgs.getAutoArgs(*state);
+
+    // lazily initialised per-thread at first use (I think this is expensive)
+    thread_local static nix::Value *vRoot = [&]() {
+        if (myArgs.flake) {
+            auto [flakeRef, fragment, outputSpec] =
+                parseFlakeRefWithFragmentAndExtendedOutputsSpec(
+                    myArgs.releaseExpr, absPath("."));
+
+            InstallableFlake flake{{},
+                                   state,
+                                   std::move(flakeRef),
+                                   fragment,
+                                   outputSpec,
+                                   {},
+                                   {},
+                                   flake::LockFlags{
+                                       .updateLockFile = false,
+                                       .useRegistries = false,
+                                       .allowUnlocked = false,
+                                   }};
+
+            return flake.toValue(*state).first;
+        } else {
+            return releaseExprTopLevelValue(*state, autoArgs);
+        }
+    }();
+
+    return worker_evaluate(state, autoArgs, vRoot, attrPath, f1, f2);
 }
 
 static void worker(AutoCloseFD &to, AutoCloseFD &from) {
@@ -368,9 +403,21 @@ static void worker(AutoCloseFD &to, AutoCloseFD &from) {
 
         /* Evaluate it and send info back to the collector. */
         try {
-            json reply = {{"attr", attr}, {"attrPath", attrPath}};
-            reply.update(worker_evaluate(state, autoArgs, vRoot, attr));
-            writeLine(to.get(), reply.dump());
+            worker_evaluate(
+                state, autoArgs, vRoot, attr,
+                [&](auto &&d) {
+                    json reply = {{"attr", attr}, {"attrPath", attrPath}};
+                    reply.update(d);
+                    writeLine(to.get(), reply.dump());
+                },
+                [&](auto &&attrs) {
+                    json reply = {{"attr", attr},
+                                  {"attrPath", attrPath},
+                                  {"attrs", attrs}};
+                    writeLine(to.get(), reply.dump());
+                });
+            /* reply.update(worker_evaluate(state, autoArgs, vRoot, attr)); */
+            /* writeLine(to.get(), reply.dump()); */
         } catch (EvalError &e) {
             auto err = e.info();
             std::ostringstream oss;
@@ -574,7 +621,6 @@ int main(int argc, char **argv) {
 
         Sync<State> state_;
 
-        /* Start a collector thread per worker process. */
         std::vector<std::thread> threads;
         std::condition_variable wakeup;
         for (size_t i = 0; i < myArgs.nrWorkers; i++)
