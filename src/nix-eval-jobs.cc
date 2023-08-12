@@ -74,7 +74,6 @@ struct MyArgs : MixEvalArgs, MixCommonArgs {
                 ::exit(0);
             }},
         });
-
         addFlag({.longName = "impure",
                  .description = "allow impure expressions",
                  .handler = {&impure, true}});
@@ -282,17 +281,6 @@ std::string attrPathJoin(std::string_view root, std::string_view attr) {
     return s.str();
 }
 
-void addGCRoot(EvalState const &state, Drv const &drv) {
-    if (myArgs.gcRootsDir != "") {
-        Path root = myArgs.gcRootsDir + "/" + baseNameOf(drv.drvPath);
-        if (!pathExists(root)) {
-            auto localStore = state.store.dynamic_pointer_cast<LocalFSStore>();
-            auto storePath = localStore->parseStorePath(drv.drvPath);
-            localStore->addPermRoot(storePath, root);
-        }
-    }
-}
-
 template <typename F1, typename F2>
 void evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
               std::string const &attrPath, F1 f1, F2 f2) {
@@ -306,11 +294,6 @@ void evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
     if (v->type() == nAttrs) {
         if (auto drvInfo = getDerivation(*state, *v, false)) {
             auto drv = mkDrv(*state, *drvInfo);
-
-            /* Register the derivation as a GC root.  !!! This
-               registers roots for jobs that we may have already
-               done. */
-            addGCRoot(*state, drv);
             f1(drv);
         } else {
             bool hasRecurseForDerivations = [&]() {
@@ -350,8 +333,8 @@ int main(int argc, char **argv) {
 
         myArgs.parseCmdline(argvToStrings(argc, argv));
 
-        /* FIXME: The build hook in conjunction with import-from-derivation is
-         * causing "unexpected EOF" during eval */
+        /* FIXME: The build hook in conjunction with import-from-derivation
+         * is causing "unexpected EOF" during eval */
         settings.builders = "";
 
         /* Prevent access to paths outside of the Nix search path and
@@ -374,6 +357,16 @@ int main(int argc, char **argv) {
         } else {
             myArgs.gcRootsDir = std::filesystem::absolute(myArgs.gcRootsDir);
         }
+
+        auto addGCRoot = [](Drv const &drv, ref<EvalState> state) -> void {
+            Path root = myArgs.gcRootsDir + "/" + baseNameOf(drv.drvPath);
+            if (!pathExists(root)) {
+                auto localStore =
+                    state->store.dynamic_pointer_cast<LocalFSStore>();
+                auto storePath = localStore->parseStorePath(drv.drvPath);
+                localStore->addPermRoot(storePath, root);
+            }
+        };
 
         if (myArgs.showTrace) {
             loggerSettings.showTrace.assign(true);
@@ -403,6 +396,11 @@ int main(int argc, char **argv) {
                 evaluate(
                     state, autoArgs, vRoot, attrPath,
                     [&](Drv const &drv) {
+                        /* Register the derivation as a GC root.  !!! This
+                           registers roots for jobs that we may have already
+                           done. */
+                        if (myArgs.gcRootsDir != "")
+                            addGCRoot(drv, state);
                         std::cout << nlohmann::json{drv} << std::endl;
                     },
                     [&](auto &&attrs) {
