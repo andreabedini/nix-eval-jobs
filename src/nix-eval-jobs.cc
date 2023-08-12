@@ -1,10 +1,11 @@
-#include "ref.hh"
-#include <map>
+#include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <queue>
+#include <ranges>
 #include <string>
 #include <thread>
-#include <filesystem>
 
 #include <nix/config.h>
 #include <nix/shared.hh>
@@ -25,6 +26,7 @@
 #include <nix/installables.hh>
 #include <nix/path-with-outputs.hh>
 #include <nix/installable-flake.hh>
+#include <nix/ref.hh>
 
 #include <nix/value-to-json.hh>
 
@@ -44,7 +46,7 @@ using namespace nlohmann;
 #pragma clang diagnostic ignored "-Wnon-virtual-dtor"
 #endif
 struct MyArgs : MixEvalArgs, MixCommonArgs {
-    std::string releaseExpr;
+    std::string expr;
     Path gcRootsDir;
     bool flake = false;
     bool fromArgs = false;
@@ -128,9 +130,10 @@ struct MyArgs : MixEvalArgs, MixCommonArgs {
                  .description = "treat the argument as a Nix expression",
                  .handler = {&fromArgs, true}});
 
-        expectArg("expr", &releaseExpr);
+        expectArg("expr", &expr);
     }
 };
+
 #ifdef __GNUC__
 #pragma GCC diagnostic ignored "-Wnon-virtual-dtor"
 #elif __clang__
@@ -139,22 +142,37 @@ struct MyArgs : MixEvalArgs, MixCommonArgs {
 
 static MyArgs myArgs;
 
-static Value *releaseExprTopLevelValue(EvalState &state, Bindings &autoArgs) {
-    Value vTop;
+static Value *topLevelValue(ref<EvalState> state, Bindings &autoArgs) {
+    if (myArgs.flake) {
+        auto [flakeRef, fragment, outputSpec] =
+            parseFlakeRefWithFragmentAndExtendedOutputsSpec(myArgs.expr,
+                                                            absPath("."));
 
-    if (myArgs.fromArgs) {
-        Expr *e = state.parseExprFromString(
-            myArgs.releaseExpr, state.rootPath(CanonPath::fromCwd()));
-        state.eval(e, vTop);
+        InstallableFlake flake{{},
+                               state,
+                               std::move(flakeRef),
+                               fragment,
+                               outputSpec,
+                               {},
+                               {},
+                               flake::LockFlags{
+                                   .updateLockFile = false,
+                                   .useRegistries = false,
+                                   .allowUnlocked = false,
+                               }};
+
+        return flake.toValue(*state).first;
+    } else if (myArgs.fromArgs) {
+        Value *vRoot = state->allocValue();
+        Expr *e = state->parseExprFromString(
+            myArgs.expr, state->rootPath(CanonPath::fromCwd()));
+        state->eval(e, *vRoot);
+        return vRoot;
     } else {
-        state.evalFile(lookupFileArg(state, myArgs.releaseExpr), vTop);
+        Value *vRoot = state->allocValue();
+        state->evalFile(lookupFileArg(*state, myArgs.expr), *vRoot);
+        return vRoot;
     }
-
-    auto vRoot = state.allocValue();
-
-    state.autoCallFunction(autoArgs, vTop, *vRoot);
-
-    return vRoot;
 }
 
 bool queryIsCached(Store &store, std::map<std::string, std::string> &outputs) {
@@ -180,56 +198,61 @@ struct Drv {
     std::map<std::string, std::string> outputs;
     std::map<std::string, std::set<std::string>> inputDrvs;
     std::optional<nlohmann::json> meta;
-
-    Drv(EvalState &state, DrvInfo &drvInfo) {
-        if (drvInfo.querySystem() == "unknown")
-            throw EvalError("derivation must have a 'system' attribute");
-
-        auto localStore = state.store.dynamic_pointer_cast<LocalFSStore>();
-
-        try {
-            for (auto out : drvInfo.queryOutputs(true)) {
-                if (out.second)
-                    outputs[out.first] =
-                        localStore->printStorePath(*out.second);
-            }
-        } catch (const std::exception &e) {
-            throw EvalError("derivation must have valid outputs: %s", e.what());
-        }
-
-        if (myArgs.meta) {
-            nlohmann::json meta_;
-            for (auto &metaName : drvInfo.queryMetaNames()) {
-                NixStringContext context;
-                std::stringstream ss;
-
-                auto metaValue = drvInfo.queryMeta(metaName);
-                // Skip non-serialisable types
-                // TODO: Fix serialisation of derivations to store paths
-                if (metaValue == 0) {
-                    continue;
-                }
-
-                printValueAsJSON(state, true, *metaValue, noPos, ss, context);
-
-                meta_[metaName] = nlohmann::json::parse(ss.str());
-            }
-            meta = meta_;
-        }
-        if (myArgs.checkCacheStatus) {
-            isCached = queryIsCached(*localStore, outputs);
-        }
-
-        name = drvInfo.queryName();
-        system = drvInfo.querySystem();
-        drvPath = localStore->printStorePath(drvInfo.requireDrvPath());
-
-        auto drv = localStore->readDerivation(drvInfo.requireDrvPath());
-        for (auto &input : drv.inputDrvs) {
-            inputDrvs[localStore->printStorePath(input.first)] = input.second;
-        }
-    }
 };
+
+// printValueAsJSON prevents EvalState const&
+Drv mkDrv(EvalState &state, DrvInfo &drvInfo) {
+    Drv drv;
+
+    if (drvInfo.querySystem() == "unknown")
+        throw EvalError("derivation must have a 'system' attribute");
+
+    auto localStore = state.store.dynamic_pointer_cast<LocalFSStore>();
+
+    try {
+        for (auto out : drvInfo.queryOutputs(true)) {
+            if (out.second)
+                drv.outputs[out.first] =
+                    localStore->printStorePath(*out.second);
+        }
+    } catch (const std::exception &e) {
+        throw EvalError("derivation must have valid outputs: %s", e.what());
+    }
+
+    if (myArgs.meta) {
+        nlohmann::json meta_;
+        for (auto &metaName : drvInfo.queryMetaNames()) {
+            NixStringContext context;
+            std::stringstream ss;
+
+            auto metaValue = drvInfo.queryMeta(metaName);
+            // Skip non-serialisable types
+            // TODO: Fix serialisation of derivations to store paths
+            if (metaValue == 0) {
+                continue;
+            }
+
+            printValueAsJSON(state, true, *metaValue, noPos, ss, context);
+
+            meta_[metaName] = nlohmann::json::parse(ss.str());
+        }
+        drv.meta = meta_;
+    }
+    if (myArgs.checkCacheStatus) {
+        drv.isCached = queryIsCached(*localStore, drv.outputs);
+    }
+
+    drv.name = drvInfo.queryName();
+    drv.system = drvInfo.querySystem();
+    drv.drvPath = localStore->printStorePath(drvInfo.requireDrvPath());
+
+    auto _drv = localStore->readDerivation(drvInfo.requireDrvPath());
+    for (auto &input : _drv.inputDrvs) {
+        drv.inputDrvs[localStore->printStorePath(input.first)] = input.second;
+    }
+
+    return drv;
+}
 
 static void to_json(nlohmann::json &json, const Drv &drv) {
     json = nlohmann::json{{"name", drv.name},
@@ -247,333 +270,70 @@ static void to_json(nlohmann::json &json, const Drv &drv) {
     }
 }
 
-std::string attrPathJoin(json input) {
-    return std::accumulate(input.begin(), input.end(), std::string(),
-                           [](std::string ss, std::string s) {
-                               // Escape token if containing dots
-                               if (s.find(".") != std::string::npos) {
-                                   s = "\"" + s + "\"";
-                               }
-                               return ss.empty() ? s : ss + "." + s;
-                           });
+std::string attrPathJoin(std::string_view root, std::string_view attr) {
+    std::stringstream s;
+    if (!root.empty())
+        s << root + ".";
+    // Escape token if containing dots
+    if (attr.find(".") != std::string::npos)
+        s << "\"" + attr + "\"";
+    else
+        s << attr;
+    return s.str();
+}
+
+void addGCRoot(EvalState const &state, Drv const &drv) {
+    if (myArgs.gcRootsDir != "") {
+        Path root = myArgs.gcRootsDir + "/" + baseNameOf(drv.drvPath);
+        if (!pathExists(root)) {
+            auto localStore = state.store.dynamic_pointer_cast<LocalFSStore>();
+            auto storePath = localStore->parseStorePath(drv.drvPath);
+            localStore->addPermRoot(storePath, root);
+        }
+    }
 }
 
 template <typename F1, typename F2>
-void worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
-                     std::string const &attrPath, F1 f1, F2 f2) {
-    auto vTmp = findAlongAttrPath(*state, attrPath, autoArgs, *vRoot).first;
+void evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
+              std::string const &attrPath, F1 f1, F2 f2) {
 
+    debug("Evaluating attrPath %s", attrPath);
+
+    auto vTmp = findAlongAttrPath(*state, attrPath, autoArgs, *vRoot).first;
     auto v = state->allocValue();
     state->autoCallFunction(autoArgs, *vTmp, *v);
 
     if (v->type() == nAttrs) {
         if (auto drvInfo = getDerivation(*state, *v, false)) {
-            auto drv = Drv(*state, *drvInfo);
+            auto drv = mkDrv(*state, *drvInfo);
 
             /* Register the derivation as a GC root.  !!! This
                registers roots for jobs that we may have already
                done. */
-            if (myArgs.gcRootsDir != "") {
-                Path root = myArgs.gcRootsDir + "/" +
-                            std::string(baseNameOf(drv.drvPath));
-                if (!pathExists(root)) {
-                    auto localStore =
-                        state->store.dynamic_pointer_cast<LocalFSStore>();
-                    auto storePath = localStore->parseStorePath(drv.drvPath);
-                    localStore->addPermRoot(storePath, root);
-                }
-            }
-
+            addGCRoot(*state, drv);
             f1(drv);
         } else {
-            auto attrs = std::vector<std::string>();
+            bool hasRecurseForDerivations = [&]() {
+                auto attrv = v->attrs->get(state->sRecurseForDerivations);
+                return attrv && state->forceBool(
+                                    *attrv->value, attrv->pos,
+                                    "while evaluating recurseForDerivations");
+            }();
 
-            // Dont require `recurseForDerivations = true;` for top-level
-            // attrset
-            bool recurse = myArgs.forceRecurse || attrPath == "";
-
-            for (auto &i : v->attrs->lexicographicOrder(state->symbols)) {
-                const std::string &name = state->symbols[i->name];
-                attrs.push_back(name);
-
-                // TODO: I think we add "recurseForDerivations" to the
-                // attributes to recurse into, even if we know it's a boolean
-                if (name == "recurseForDerivations" && !myArgs.forceRecurse) {
-                    auto attrv = v->attrs->get(state->sRecurseForDerivations);
-                    recurse = state->forceBool(
-                        *attrv->value, attrv->pos,
-                        "while evaluating recurseForDerivations");
+            // We do not require `recurseForDerivations = true;` for
+            // top-level attrset
+            if (attrPath == "" || myArgs.forceRecurse ||
+                hasRecurseForDerivations) {
+                auto attrs = std::vector<std::string>();
+                attrs.reserve(v->attrs->size());
+                for (auto &i : *v->attrs) {
+                    const std::string &name = state->symbols[i.name];
+                    attrs.push_back(attrPathJoin(attrPath, name));
                 }
-            }
-            if (recurse)
                 f2(attrs);
-        }
-    }
-}
-
-template <typename F1, typename F2>
-void worker_evaluate_wrapper(std::string attrPath, F1 f1, F2 f2) {
-
-    // I don't think this needs to be shared, we own it and it could be on the
-    // stack. But InstallableFlake wants a ref<EvalState> which is a shared
-    // pointer, so I wonder what it does with it. Better play safe and give it
-    // what it wants.
-    auto state =
-        make_ref<EvalState>(myArgs.searchPath, openStore(*myArgs.evalStoreUrl));
-
-    Bindings &autoArgs = *myArgs.getAutoArgs(*state);
-
-    // lazily initialised per-thread at first use (I think this is expensive)
-    thread_local static nix::Value *vRoot = [&]() {
-        if (myArgs.flake) {
-            auto [flakeRef, fragment, outputSpec] =
-                parseFlakeRefWithFragmentAndExtendedOutputsSpec(
-                    myArgs.releaseExpr, absPath("."));
-
-            InstallableFlake flake{{},
-                                   state,
-                                   std::move(flakeRef),
-                                   fragment,
-                                   outputSpec,
-                                   {},
-                                   {},
-                                   flake::LockFlags{
-                                       .updateLockFile = false,
-                                       .useRegistries = false,
-                                       .allowUnlocked = false,
-                                   }};
-
-            return flake.toValue(*state).first;
-        } else {
-            return releaseExprTopLevelValue(*state, autoArgs);
-        }
-    }();
-
-    return worker_evaluate(state, autoArgs, vRoot, attrPath, f1, f2);
-}
-
-static void worker(AutoCloseFD &to, AutoCloseFD &from) {
-    // I don't think this needs to be shared, we own it and it could be on the
-    // stack. But InstallableFlake wants a ref<EvalState> which is a shared
-    // pointer, so I wonder what it does with it. Better play safe and give it
-    // what it wants.
-    auto state =
-        make_ref<EvalState>(myArgs.searchPath, openStore(*myArgs.evalStoreUrl));
-
-    Bindings &autoArgs = *myArgs.getAutoArgs(*state);
-
-    nix::Value *vRoot = [&]() {
-        if (myArgs.flake) {
-            auto [flakeRef, fragment, outputSpec] =
-                parseFlakeRefWithFragmentAndExtendedOutputsSpec(
-                    myArgs.releaseExpr, absPath("."));
-
-            InstallableFlake flake{{},
-                                   state,
-                                   std::move(flakeRef),
-                                   fragment,
-                                   outputSpec,
-                                   {},
-                                   {},
-                                   flake::LockFlags{
-                                       .updateLockFile = false,
-                                       .useRegistries = false,
-                                       .allowUnlocked = false,
-                                   }};
-
-            return flake.toValue(*state).first;
-        } else {
-            return releaseExprTopLevelValue(*state, autoArgs);
-        }
-    }();
-
-    while (true) {
-        /* Wait for the collector to send us a job name. */
-        writeLine(to.get(), "next");
-
-        auto s = readLine(from.get());
-        if (s == "exit")
-            break;
-        if (!hasPrefix(s, "do "))
-            abort();
-        auto attrPath = json::parse(s.substr(3));
-        auto attr = attrPathJoin(attrPath);
-
-        debug("worker process %d at '%s'", getpid(), attrPath);
-
-        /* Evaluate it and send info back to the collector. */
-        try {
-            worker_evaluate(
-                state, autoArgs, vRoot, attr,
-                [&](auto &&d) {
-                    json reply = {{"attr", attr}, {"attrPath", attrPath}};
-                    reply.update(d);
-                    writeLine(to.get(), reply.dump());
-                },
-                [&](auto &&attrs) {
-                    json reply = {{"attr", attr},
-                                  {"attrPath", attrPath},
-                                  {"attrs", attrs}};
-                    writeLine(to.get(), reply.dump());
-                });
-            /* reply.update(worker_evaluate(state, autoArgs, vRoot, attr)); */
-            /* writeLine(to.get(), reply.dump()); */
-        } catch (EvalError &e) {
-            auto err = e.info();
-            std::ostringstream oss;
-            showErrorInfo(oss, err, loggerSettings.showTrace.get());
-            auto msg = oss.str();
-
-            // Don't forget to print it into the STDERR log, this is
-            // what's shown in the Hydra UI.
-            printError(e.msg());
-
-            // Transmits the error we got from the previous evaluation
-            // in the JSON output.
-            json reply = {{"attr", attr},
-                          {"attrPath", attrPath},
-                          {"error", filterANSIEscapes(msg, true)}};
-
-            writeLine(to.get(), reply.dump());
-        }
-
-        /* If our RSS exceeds the maximum, exit. The collector will
-           start a new process. */
-        struct rusage r;
-        getrusage(RUSAGE_SELF, &r);
-        if ((size_t)r.ru_maxrss > myArgs.maxMemorySize * 1024)
-            break;
-    }
-
-    writeLine(to.get(), "restart");
-}
-
-typedef std::function<void(AutoCloseFD &to, AutoCloseFD &from)> Processor;
-
-/* Auto-cleanup of fork's process and fds. */
-struct Proc {
-    AutoCloseFD to, from;
-    Pid pid;
-
-    Proc(const Processor &proc) {
-        Pipe toPipe, fromPipe;
-        toPipe.create();
-        fromPipe.create();
-        auto p = startProcess(
-            [&,
-             to{std::make_shared<AutoCloseFD>(std::move(fromPipe.writeSide))},
-             from{
-                 std::make_shared<AutoCloseFD>(std::move(toPipe.readSide))}]() {
-                debug("created worker process %d", getpid());
-                try {
-                    proc(*to, *from);
-                } catch (Error &e) {
-                    nlohmann::json err;
-                    auto msg = e.msg();
-                    err["error"] = filterANSIEscapes(msg, true);
-                    printError(msg);
-                    writeLine(to->get(), err.dump());
-                    // Don't forget to print it into the STDERR log, this is
-                    // what's shown in the Hydra UI.
-                    writeLine(to->get(), "restart");
-                }
-            },
-            ProcessOptions{.allowVfork = false});
-
-        to = std::move(toPipe.writeSide);
-        from = std::move(fromPipe.readSide);
-        pid = p;
-    }
-};
-
-struct State {
-    std::set<json> todo = json::array({json::array()});
-    std::set<json> active;
-    std::exception_ptr exc;
-};
-
-std::function<void()> collector(Sync<State> &state_,
-                                std::condition_variable &wakeup) {
-    return [&]() {
-        try {
-            auto proc = std::make_unique<Proc>(worker);
-
-            while (true) {
-                /* Check whether the existing worker process is still there. */
-                auto s = readLine(proc->from.get());
-
-                if (s == "restart") {
-                    proc = std::make_unique<Proc>(worker);
-                    continue;
-                } else if (s == "next") {
-                    /* Wait for a job name to become available. */
-
-                    json attrPath;
-                    bool job_name_available = false;
-                    while (!job_name_available) {
-                        checkInterrupt();
-                        auto state(state_.lock());
-                        if (state->exc) {
-                            writeLine(proc->to.get(), "exit");
-                            return;
-                        }
-                        if (state->todo.empty()) {
-                            if (state->active.empty()) {
-                                writeLine(proc->to.get(), "exit");
-                                return;
-                            } else {
-                                state.wait(wakeup);
-                            }
-                        } else {
-                            attrPath = *state->todo.begin();
-                            state->todo.erase(state->todo.begin());
-                            state->active.insert(attrPath);
-                            job_name_available = true;
-                        }
-                    }
-
-                    /* Tell the worker to evaluate it. */
-                    writeLine(proc->to.get(), "do " + attrPath.dump());
-
-                    /* Wait for the response. */
-                    auto respString = readLine(proc->from.get());
-                    auto response = json::parse(respString);
-
-                    /* Handle the response. */
-                    if (response.find("attrs") != response.end()) {
-                        std::vector<json> newAttrs;
-
-                        for (auto &i : response["attrs"]) {
-                            json newAttr = json(response["attrPath"]);
-                            newAttr.emplace_back(i);
-                            newAttrs.push_back(newAttr);
-                        }
-                        /* Add newly discovered job names to the queue. */
-                        {
-                            auto state(state_.lock());
-                            state->active.erase(attrPath);
-                            for (auto p : newAttrs) {
-                                state->todo.insert(p);
-                            }
-                            wakeup.notify_all();
-                        }
-                    } else {
-                        // this is actually a mutex on stdout
-                        auto state(state_.lock());
-                        state->active.erase(attrPath);
-                        std::cout << respString << "\n" << std::flush;
-                    }
-                } else {
-                    auto json = json::parse(s);
-                    throw Error("worker error: %s", (std::string)json["error"]);
-                }
             }
-        } catch (...) {
-            auto state(state_.lock());
-            state->exc = std::current_exception();
-            wakeup.notify_all();
         }
-    };
+    }
 }
 
 int main(int argc, char **argv) {
@@ -606,7 +366,7 @@ int main(int argc, char **argv) {
             evalSettings.pureEval = true;
         }
 
-        if (myArgs.releaseExpr == "")
+        if (myArgs.expr == "")
             throw UsageError("no expression specified");
 
         if (myArgs.gcRootsDir == "") {
@@ -619,19 +379,37 @@ int main(int argc, char **argv) {
             loggerSettings.showTrace.assign(true);
         }
 
-        Sync<State> state_;
+        // I don't think this needs to be shared, we own it and it could be
+        // on the stack. But InstallableFlake wants a ref<EvalState> which
+        // is a shared pointer, so I wonder what it does with it. Better
+        // play safe and give it what it wants.
+        auto state = make_ref<EvalState>(myArgs.searchPath,
+                                         openStore(*myArgs.evalStoreUrl));
 
-        std::vector<std::thread> threads;
-        std::condition_variable wakeup;
-        for (size_t i = 0; i < myArgs.nrWorkers; i++)
-            threads.emplace_back(std::thread(collector(state_, wakeup)));
+        Bindings &autoArgs = *myArgs.getAutoArgs(*state);
 
-        for (auto &thread : threads)
-            thread.join();
+        // lazily initialised per-thread at first use (I think this is
+        // expensive)
+        Value *vRoot = topLevelValue(state, autoArgs);
 
-        auto state(state_.lock());
+        std::queue<std::string> q;
+        q.push("");
 
-        if (state->exc)
-            std::rethrow_exception(state->exc);
+        std::jthread([&]() {
+            while (q.size() > 0) {
+                auto attrPath = q.front();
+                q.pop();
+
+                evaluate(
+                    state, autoArgs, vRoot, attrPath,
+                    [&](Drv const &drv) {
+                        std::cout << nlohmann::json{drv} << std::endl;
+                    },
+                    [&](auto &&attrs) {
+                        for (auto &&attr : attrs)
+                            q.push(attr);
+                    });
+            };
+        });
     });
 }
