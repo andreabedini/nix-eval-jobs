@@ -28,12 +28,14 @@
 #include <nix/installable-flake.hh>
 
 #include <nix/value-to-json.hh>
+#include <nix/downstream-placeholder.hh>
 
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
 
 #include <nlohmann/json.hpp>
+#include <utility>
 #include <variant>
 
 using namespace nix;
@@ -272,8 +274,41 @@ worker_evaluate(ref<EvalState> state, Bindings &autoArgs, Value *vRoot,
 
     if (v->type() == nAttrs) {
         if (auto drvInfo = getDerivation(*state, *v, false)) {
+
+            auto localStore = state->store.dynamic_pointer_cast<LocalFSStore>();
+
+            if (v->attrs) {
+                Bindings::iterator i = v->attrs->find(state->sOutPath);
+                NixStringContext context;
+                if (i != v->attrs->end()) {
+                    std::cout << state->symbols[i->name] << "\t"
+                              << i->value->type() << "\n";
+                    auto v = i->value;
+                    if (v->isThunk()) {
+                        Env *env = v->thunk.env;
+                        Expr *expr = v->thunk.expr;
+                        expr->show(state->symbols, std::cout);
+                        std::cout << std::endl;
+                        /* try { */
+                        /*     v->mkBlackhole(); */
+                        /*     // checkInterrupt(); */
+                        /*     expr->eval(*state, *env, *v); */
+                        /* } catch (...) { */
+                        /*     v->mkThunk(env, expr); */
+                        /*     throw; */
+                        /* } */
+                    }
+                }
+            }
+
+            /* std::cout << drvInfo->queryOutPath().to_string() << "\n"; */
+            /**/
+            /* for (auto out : drvInfo->queryOutputs(true)) { */
+            /*     std::cout << out.first << "\t" << out.second->to_string() */
+            /*               << "\n"; */
+            /* } */
+
             auto drv = Drv(*state, *drvInfo);
-            /* reply.update(drv); */
 
             /* Register the derivation as a GC root.  !!! This
                registers roots for jobs that we may have already
@@ -590,65 +625,56 @@ int main(int argc, char **argv) {
     /* We are doing the garbage collection by killing forks */
     setenv("GC_DONT_GC", "1", 1);
 
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-        initGC();
+    initNix();
+    initGC();
 
-        myArgs.parseCmdline(argvToStrings(argc, argv));
+    myArgs.parseCmdline(argvToStrings(argc, argv));
 
-        /* FIXME: The build hook in conjunction with import-from-derivation is
-         * causing "unexpected EOF" during eval */
-        settings.builders = "";
+    /* Prevent access to paths outside of the Nix search path and
+       to the environment. */
+    evalSettings.restrictEval = false;
 
-        /* Prevent access to paths outside of the Nix search path and
-           to the environment. */
-        evalSettings.restrictEval = false;
+    evalSettings.enableImportFromDerivation = false;
 
-        /* When building a flake, use pure evaluation (no access to
-           'getEnv', 'currentSystem' etc. */
-        if (myArgs.impure) {
-            evalSettings.pureEval = false;
-        } else if (myArgs.flake) {
-            evalSettings.pureEval = true;
-        }
+    /* When building a flake, use pure evaluation (no access to
+       'getEnv', 'currentSystem' etc. */
+    if (myArgs.impure) {
+        evalSettings.pureEval = false;
+    } else if (myArgs.flake) {
+        evalSettings.pureEval = true;
+    }
 
-        if (myArgs.releaseExpr == "")
-            throw UsageError("no expression specified");
+    if (myArgs.releaseExpr == "")
+        throw UsageError("no expression specified");
 
-        if (myArgs.gcRootsDir == "") {
-            printMsg(lvlError, "warning: `--gc-roots-dir' not specified");
-        } else {
-            myArgs.gcRootsDir = std::filesystem::absolute(myArgs.gcRootsDir);
-        }
+    if (myArgs.gcRootsDir == "") {
+        printMsg(lvlError, "warning: `--gc-roots-dir' not specified");
+    } else {
+        myArgs.gcRootsDir = std::filesystem::absolute(myArgs.gcRootsDir);
+    }
 
-        if (myArgs.showTrace) {
-            loggerSettings.showTrace.assign(true);
-        }
+    if (myArgs.showTrace) {
+        loggerSettings.showTrace.assign(true);
+    }
 
-        /* auto r = worker_evaluate_wrapper(""); */
-        auto r = std::async(std::launch::async, worker_evaluate_wrapper, "");
-        std::visit([](auto &&v) { std::cout << json(v) << "\n"; }, r.get());
+    auto r = worker_evaluate_wrapper("");
+    std::visit([](auto &&v) { std::cout << json(v) << "\n"; }, r);
 
-        auto r2 =
-            std::async(std::launch::async, worker_evaluate_wrapper, "BufOnly");
-        std::visit([](auto &&v) { std::cout << json(v) << "\n"; }, r2.get());
+    /* std::cout << worker_evaluate_wrapper("") << "\n"; */
+    /* std::cout << worker_evaluate_wrapper("BufOnly") << "\n"; */
 
-        /* std::cout << worker_evaluate_wrapper("") << "\n"; */
-        /* std::cout << worker_evaluate_wrapper("BufOnly") << "\n"; */
-
-        /* Sync<State> state_; */
-        /**/
-        /* std::vector<std::thread> threads; */
-        /* std::condition_variable wakeup; */
-        /* for (size_t i = 0; i < myArgs.nrWorkers; i++) */
-        /*     threads.emplace_back(std::thread(collector(state_, wakeup))); */
-        /**/
-        /* for (auto &thread : threads) */
-        /*     thread.join(); */
-        /**/
-        /* auto state(state_.lock()); */
-        /**/
-        /* if (state->exc) */
-        /*     std::rethrow_exception(state->exc); */
-    });
+    /* Sync<State> state_; */
+    /**/
+    /* std::vector<std::thread> threads; */
+    /* std::condition_variable wakeup; */
+    /* for (size_t i = 0; i < myArgs.nrWorkers; i++) */
+    /*     threads.emplace_back(std::thread(collector(state_, wakeup))); */
+    /**/
+    /* for (auto &thread : threads) */
+    /*     thread.join(); */
+    /**/
+    /* auto state(state_.lock()); */
+    /**/
+    /* if (state->exc) */
+    /*     std::rethrow_exception(state->exc); */
 }

@@ -16,6 +16,8 @@ stdenv.mkDerivation {
   buildInputs = with pkgs; [
     nlohmann_json
     nix
+    nix.debug
+    nix.dev
     boost
   ];
   nativeBuildInputs = with pkgs; [
